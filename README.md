@@ -1,7 +1,5 @@
 # example_5
 
-• **Sep 02** – Discussed with Pablo the need for an additional SCOPE request to access updated QUASAR clinical data. Initial access had been granted for model training and validation, followed by a subsequent request that provided data through Week 188. With additional data now available beyond Week 200, a new SCOPE request was indicated as necessary.
+• Oct 09 – Basudeb followed up with Raju regarding the pending STARDUST variable gap analysis. Raju clarified that his previous assessment was performed using an Agentic AI approach combined with ADaM metadata. He emphasized that access to the metadata is essential to validate the assessment findings and recommended coordinating with the Data Acquisition team to obtain the necessary access.
 
-  > Pablo raised concerns about the scalability of requiring separate SCOPE requests for each new data update or analysis, emphasizing the need for a more sustainable data access process aligned with DDSAI leadership objectives.
-> 
-**Current Activity:** Evaluate the need for a new SCOPE request to access QUASAR clinical data beyond Week 200 and align with the relevant teams on a more scalable data access process. Current available datasets remain limited to MAINT-WK44.
+• Coordinate with the Data Acquisition team to obtain access to the relevant STARDUST ADaM metadata and validate the source/derivation of the remaining unmapped variables.
