@@ -1,3 +1,5 @@
 # example_5
 
-ard_available = count_studies_with_asset(df, "ARD")
+[server]
+maxUploadSize = 2048
+maxMessageSize = 2048
