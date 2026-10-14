@@ -1,41 +1,55 @@
 # example_5
 
+
 from pathlib import Path
-from zipfile import ZipFile, ZIP_DEFLATED
+import hashlib
 
-# Pasta onde estão os ARDs
-INPUT = Path.home() / "OneDrive - JNJ" / "Desktop" / "ard_data"
+# Localizar a pasta ard_data
+PASTA = Path.home() / "OneDrive - JNJ" / "Desktop" / "ard_data"
 
-# Identificar automaticamente os ARDs do QUASAR
-FILES = sorted(INPUT.glob("*quasar*ard*.xlsx"))
+ZIP = PASTA / "QUASAR_ALL_ARD.zip"
+DESTINO = PASTA / "quasar_partes"
 
-# Arquivo ZIP de saída
-OUTPUT = INPUT / "QUASAR_ALL_ARD.zip"
+TAMANHO_PARTE = 25 * 1024 * 1024  # 25 MiB
 
-print(f"Pasta: {INPUT}")
-print(f"Arquivos encontrados: {len(FILES)}")
+if not ZIP.is_file():
+    raise FileNotFoundError(f"ZIP não encontrado: {ZIP}")
 
-for file in FILES:
-    print(f" - {file.name}")
+DESTINO.mkdir(exist_ok=True)
 
-if len(FILES) != 6:
+# Evitar misturar partes antigas com novas
+if list(DESTINO.glob("QUASAR_ALL_ARD.zip.part*")):
     raise RuntimeError(
-        f"Esperados 6 arquivos, encontrados {len(FILES)}. "
-        "Confira a seleção antes de compactar."
+        "Já existem partes nesta pasta. "
+        "Remova ou mova as partes antigas antes de executar."
     )
 
-with ZipFile(
-    OUTPUT,
-    mode="w",
-    compression=ZIP_DEFLATED,
-    compresslevel=9
-) as archive:
+sha256 = hashlib.sha256()
+numero = 0
 
-    for file in FILES:
-        archive.write(file, arcname=file.name)
-        print(f"Adicionado: {file.name}")
+with ZIP.open("rb") as origem:
+    while True:
+        bloco = origem.read(TAMANHO_PARTE)
 
-size_mb = OUTPUT.stat().st_size / (1024 ** 2)
+        if not bloco:
+            break
 
-print(f"\nZIP criado com sucesso: {OUTPUT}")
-print(f"Tamanho final: {size_mb:.2f} MB")
+        numero += 1
+        sha256.update(bloco)
+
+        nome = f"{ZIP.name}.part{numero:03d}"
+        caminho = DESTINO / nome
+        caminho.write_bytes(bloco)
+
+        print(f"Criado: {nome} ({len(bloco) / 1024**2:.2f} MiB)")
+
+hash_original = sha256.hexdigest()
+
+(DESTINO / "QUASAR_SHA256.txt").write_text(
+    f"{hash_original}  {ZIP.name}\n",
+    encoding="utf-8"
+)
+
+print(f"\nTotal de partes: {numero}")
+print(f"SHA-256: {hash_original}")
+print(f"Pasta: {DESTINO}")
