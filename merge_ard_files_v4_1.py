@@ -1,26 +1,28 @@
-"""Memory-efficient ARD reconciliation, using SQLite + streaming XLSX I/O.
-
-Dependencies: pip install openpyxl
-Clinical matching: USUBJID + AVISIT + AVISITN + AVISIT_ORDER.
-Incomplete keys remain separate. Input order determines the first retained value.
-Conflicts are preserved as `value1 | value2`, consistent with V3.
-"""
 from __future__ import annotations
+
+import csv
+import contextlib
+import hashlib
 import json
 import math
-import sqlite3
-import tempfile
-import gc
-import time
 import shutil
+import tempfile
 from collections import Counter
 from datetime import date, datetime
-from numbers import Number
 from pathlib import Path
-from openpyxl import load_workbook, Workbook
 
-INPUT_FOLDER = Path(r"C:\Users\JMende95\OneDrive - JNJ\Desktop\ard_data")
-OUTPUT_FOLDER = INPUT_FOLDER / "merged_xlsx"
+try:
+    import duckdb
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from openpyxl import Workbook, load_workbook
+except ImportError as exc:
+    raise SystemExit("Install dependencies: py -m pip install duckdb pyarrow openpyxl") from exc
+
+# -------------------- CONFIGURATION --------------------
+INPUT_FOLDER = Path("/mnt/quasar/input")
+OUTPUT_FOLDER = Path("/mnt/quasar/output_v4_1")
+# Work in the Domino /mnt volume; confirm persistence before closing workspace.
 FILES_TO_MERGE = [
     "CNTO1959UCO3001_quasar_ind1_wk32_ard_20260619.xlsx",
     "CNTO1959UCO3001_quasar_ind2_wk32_ard_20260621.xlsx",
@@ -29,280 +31,364 @@ FILES_TO_MERGE = [
     "CNTO1959UCO3001_quasar_lte_wk140_ard_20261013.xlsx",
     "CNTO1959UCO3001_quasar_lte_wk188_ard_20261013.xlsx",
 ]
-OUTPUT_NAME = "CNTO1959UCO3001_quasar_lte_wk188_ard_merged_20261013.xlsx"
-KEYS = ["USUBJID", "AVISIT", "AVISITN", "AVISIT_ORDER"]
-SEP = " | "
-STRICT_VISIT_QC = True
-BATCH_SIZE = 1000
-MAX_EXCEL_COLUMNS = 16384
-MAX_EXCEL_ROWS = 1048576
+KEYS = ("USUBJID", "AVISIT", "AVISITN", "AVISIT_ORDER")
+MIN_FREE_GB = 10  # conservative minimum; large studies may need considerably more
+MEMORY_LIMIT = "16GB"  # initial DuckDB limit; container reports ~81 GiB cgroup cap
+THREADS = 2
+ROWS_PER_PARQUET_BATCH = 250
+# CSV is a convenience export only; all conflicts are ALWAYS in Parquet.
+MAX_CONFLICT_CSV_ROWS = 900_000
+KEEP_STAGING_FILES = False
+OBS_PARTITIONS = 128  # hash-based bounded aggregation
+# -------------------------------------------------------
 
 
-def missing(x):
-    return x is None or (isinstance(x, str) and not x.strip()) or (isinstance(x, float) and math.isnan(x))
+def quoted(path: Path) -> str:
+    return "'" + str(path).replace("'", "''") + "'"
 
 
-def display(x):
-    if missing(x): return ""
-    if isinstance(x, (datetime, date)):
-        return x.isoformat(sep=" ") if isinstance(x, datetime) and x.time() != datetime.min.time() else x.strftime("%Y-%m-%d")
-    return str(x).strip()
+def normalize(value) -> str:
+    """Stable text representation; never silently round clinical numbers."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat(sep=" ") if isinstance(value, datetime) else value.isoformat()
+    if isinstance(value, float):
+        if math.isnan(value):
+            return ""
+        if math.isinf(value):
+            return str(value)
+        return str(int(value)) if value.is_integer() else repr(value)
+    return str(value).strip()
 
 
-def encode(x):
-    if missing(x): return ["missing", None]
-    if isinstance(x, Number) and not isinstance(x, bool):
-        return ["number", str(float(x))]
-    if isinstance(x, (datetime, date)): return ["date", display(x)]
-    return ["text", display(x)]
+def canonical_key(parts: list[str], filename: str, row_number: int) -> tuple[str, bool]:
+    complete = all(bool(p) for p in parts)
+    # Incomplete keys NEVER match across rows/files.
+    payload = ["COMPLETE", *parts] if complete else ["INCOMPLETE", filename, row_number]
+    digest = hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode("utf-8")).hexdigest()
+    return digest, complete
 
 
-def value_equal(a, b):
-    if missing(a) or missing(b): return missing(a) and missing(b)
-    if isinstance(a, Number) and not isinstance(a, bool) and isinstance(b, Number) and not isinstance(b, bool):
-        return float(a) == float(b)
-    return display(a) == display(b)
+def check_disk(folder: Path, required_gb: int = MIN_FREE_GB):
+    free = shutil.disk_usage(folder).free / (1024 ** 3)
+    print(f"Available disk space at {folder}: {free:.1f} GB", flush=True)
+    if free < required_gb:
+        raise RuntimeError(
+            f"Only {free:.1f} GB free. At least {required_gb} GB is required "
+            "before starting. Choose another OUTPUT_FOLDER/drive or free space."
+        )
 
 
-def pack(x):
-    if isinstance(x, datetime): return json.dumps(["datetime", x.isoformat()])
-    if isinstance(x, date): return json.dumps(["date", x.isoformat()])
-    if isinstance(x, bool): return json.dumps(["bool", x])
-    if isinstance(x, Number): return json.dumps(["number", x])
-    return json.dumps(["text", str(x)])
-
-
-def unpack(s):
-    typ, value = json.loads(s)
-    if typ == "datetime": return datetime.fromisoformat(value)
-    if typ == "date": return date.fromisoformat(value)
-    return value
-
-
-def alternatives(x):
-    return list(dict.fromkeys(part.strip() for part in display(x).split(SEP) if part.strip()))
-
-
-def combine(a, b):
-    if missing(a): return b
-    if missing(b) or value_equal(a, b): return a
-    return SEP.join(dict.fromkeys(alternatives(a) + alternatives(b)))
-
-
-def sheet_rows(ws):
-    iterator = ws.iter_rows(values_only=True)
-    try: header = next(iterator)
-    except StopIteration: raise ValueError(f"Empty sheet: {ws.title}")
-    names = [str(v).strip() if v is not None else "" for v in header]
-    while names and not names[-1]: names.pop()
-    if not names or any(not n for n in names): raise ValueError(f"Blank column header in {ws.title}")
-    if len(names) != len(set(names)): raise ValueError(f"Duplicate column headers in {ws.title}")
-    for row in iterator:
-        values = row[:len(names)]
-        if not any(not missing(v) for v in values): continue
-        yield names, dict(zip(names, values))
-
-
-def setup(conn):
-    conn.executescript("""
-        CREATE TABLE records (rid INTEGER PRIMARY KEY, key_id TEXT UNIQUE NOT NULL,
-            k0 TEXT, k1 TEXT, k2 TEXT, k3 TEXT, source TEXT);
-        CREATE TABLE cells (rid INTEGER NOT NULL, col TEXT NOT NULL, val TEXT NOT NULL,
-            PRIMARY KEY (rid, col));
-        CREATE TABLE source_visits (col TEXT NOT NULL, visit TEXT NOT NULL,
-            PRIMARY KEY(col, visit));
-        CREATE TABLE dictionary (signature TEXT PRIMARY KEY, vals TEXT NOT NULL);
-        CREATE TABLE conflicts (stage TEXT, k0 TEXT, k1 TEXT, k2 TEXT, k3 TEXT,
-            col TEXT, accumulated_files TEXT, accumulated_value TEXT,
-            incoming_file TEXT, incoming_value TEXT, merged_value TEXT);
-        CREATE TABLE duplicate_groups (file TEXT, k0 TEXT, k1 TEXT, k2 TEXT, k3 TEXT,
-            row_count INTEGER, conflict_columns TEXT);
-    """)
-
-
-def process(conn, file, all_columns, dict_columns, stats):
-    print(f"Reading {file.name} ...", flush=True)
-    wb = load_workbook(file, read_only=True, data_only=True)
+def stream_workbook(path: Path, file_order: int, obs_writer, rows_writer,
+                    all_columns: list[str], stats: list[dict]):
+    wb = load_workbook(path, read_only=True, data_only=True)
     try:
-        if "ARD" not in wb.sheetnames: raise ValueError(f"{file.name}: missing ARD sheet")
+        if "ARD" not in wb.sheetnames:
+            raise ValueError(f"Missing ARD sheet: {path.name}")
         ws = wb["ARD"]
-        header = None
-        local_groups = {}
-        seen_in_file = {}
-        count = 0
-        incomplete_count = 0
-        dup_count = 0
-        for names, record in sheet_rows(ws):
-            if header is None:
-                header = names
-                if any(k not in names for k in KEYS): raise ValueError(f"{file.name}: missing required keys")
-                if any(n.startswith("__ARD_MERGE_INTERNAL") or n.endswith("__INCOMING__") for n in names):
-                    raise ValueError(f"{file.name}: reserved column header")
-                for col in names:
-                    if col not in all_columns: all_columns.append(col)
+        iterator = ws.iter_rows(values_only=True)
+        try:
+            headers = [normalize(x) for x in next(iterator)]
+        except StopIteration:
+            raise ValueError(f"Empty ARD sheet: {path.name}")
+        if any(not h for h in headers) or len(set(headers)) != len(headers):
+            raise ValueError(f"Blank/duplicate column names in {path.name}")
+        if not set(KEYS).issubset(headers):
+            raise ValueError(f"Missing clinical keys in {path.name}: {set(KEYS)-set(headers)}")
+        for name in headers:
+            if name not in all_columns:
+                all_columns.append(name)
+        key_idx = [headers.index(k) for k in KEYS]
+        val_idx = [(i, h) for i, h in enumerate(headers) if h not in KEYS]
+        count, populated, incomplete = 0, 0, 0
+        for rownum, row in enumerate(iterator, start=2):
+            if not row or all(x is None or (isinstance(x, str) and not x.strip()) for x in row):
+                continue
+            keyparts = [normalize(row[i]) if i < len(row) else "" for i in key_idx]
+            rid, complete = canonical_key(keyparts, path.name, rownum)
+            rows_writer.writerow([rid, *keyparts, path.name, rownum, file_order, int(complete)])
             count += 1
-            kvals = [record[k] for k in KEYS]
-            incomplete = any(missing(v) for v in kvals)
-            if incomplete:
-                incomplete_count += 1
-                key_id = json.dumps(["incomplete", file.name, count])
-            else:
-                key_id = json.dumps(["complete", [encode(v) for v in kvals]], ensure_ascii=False)
-            key_strings = [pack(v) if not missing(v) else None for v in kvals]
-            is_local_duplicate = False
-            if not incomplete:
-                if key_id in seen_in_file:
-                    is_local_duplicate = True
-                    dup_count += 1
-                    if key_id not in local_groups:
-                        local_groups[key_id] = [2, set(), kvals]
-                    else:
-                        local_groups[key_id][0] += 1
-                else:
-                    seen_in_file[key_id] = count
-            found = conn.execute("SELECT rid,source FROM records WHERE key_id=?", (key_id,)).fetchone()
-            if found is None:
-                cur = conn.execute("INSERT INTO records(key_id,k0,k1,k2,k3,source) VALUES(?,?,?,?,?,?)",
-                    (key_id, *key_strings, file.name))
-                rid = cur.lastrowid
-            else:
-                rid = found[0]
-            for col, val in record.items():
-                if col in KEYS or missing(val): continue
-                if "AVISIT" in record and not missing(record["AVISIT"]):
-                    conn.execute("INSERT OR IGNORE INTO source_visits VALUES(?,?)", (col, display(record["AVISIT"])))
-                previous = conn.execute("SELECT val FROM cells WHERE rid=? AND col=?", (rid, col)).fetchone()
-                if previous is None:
-                    conn.execute("INSERT INTO cells VALUES(?,?,?)", (rid, col, pack(val)))
-                else:
-                    old = unpack(previous[0])
-                    if not value_equal(old, val):
-                        merged = combine(old, val)
-                        stage = "WITHIN_FILE_DUPLICATE" if is_local_duplicate else "BETWEEN_FILES"
-                        if stage == "WITHIN_FILE_DUPLICATE": local_groups[key_id][1].add(col)
-                        conn.execute("INSERT INTO conflicts VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                            (stage, *(display(v) for v in kvals), col, found[1] if found else file.name,
-                             display(old), file.name, display(val), display(merged)))
-                        conn.execute("UPDATE cells SET val=? WHERE rid=? AND col=?", (pack(merged), rid, col))
-            if count % BATCH_SIZE == 0:
-                conn.commit()
-                print(f"  {count:,} rows", flush=True)
-        for _, (n, cols, vals) in local_groups.items():
-            conn.execute("INSERT INTO duplicate_groups VALUES(?,?,?,?,?,?,?)",
-                (file.name, *(display(v) for v in vals), n, SEP.join(sorted(cols))))
-        if "PARAMCD_DICT" in wb.sheetnames:
-            for names, record in sheet_rows(wb["PARAMCD_DICT"]):
-                for col in names:
-                    if col not in dict_columns: dict_columns.append(col)
-                sig = json.dumps([encode(record.get(col)) for col in names], ensure_ascii=False)
-                conn.execute("INSERT OR IGNORE INTO dictionary VALUES(?,?)", (sig, json.dumps({k:pack(v) for k,v in record.items() if not missing(v)})))
-        conn.commit()
-        stats.append((file.name, count, len(header or []), incomplete_count, dup_count, len(local_groups)))
-        print(f"  Done: {count:,} rows; {dup_count:,} additional within-file duplicates", flush=True)
+            incomplete += not complete
+            for i, column in val_idx:
+                value = normalize(row[i]) if i < len(row) else ""
+                if value:
+                    obs_writer.writerow([rid, column, value, path.name, file_order, rownum])
+                    populated += 1
+            if count % 10000 == 0:
+                print(f"  {path.name}: {count:,} rows, {populated:,} populated cells", flush=True)
+        stats.append({"FILE": path.name, "ROWS": count, "COLUMNS": len(headers),
+                      "POPULATED_CELLS": populated, "INCOMPLETE_KEY_ROWS": incomplete})
+        print(f"Finished {path.name}: {count:,} rows / {populated:,} populated cells", flush=True)
     finally:
         wb.close()
-        del ws
-        gc.collect()
 
 
-def write_sheet(wb, name, headers, iterator):
-    ws = wb.create_sheet(name)
-    ws.append(headers)
-    n = 0
-    for row in iterator:
-        n += 1
-        if n >= MAX_EXCEL_ROWS: raise ValueError(f"Excel row limit exceeded: {name}")
-        ws.append(row)
-    return n
-
-
-def output(conn, path, all_columns, dict_columns, stats):
-    if len(all_columns) > MAX_EXCEL_COLUMNS:
-        raise ValueError(f"ARD has {len(all_columns)} columns, exceeding Excel's {MAX_EXCEL_COLUMNS} limit")
+def export_summary(conn, output_dir: Path, file_stats: list[dict], total_columns: int):
     wb = Workbook(write_only=True)
-    ordered = KEYS + [col for col in all_columns if col not in KEYS]
-    qc = []
-    source_visits = {}
-    for col, visit in conn.execute("SELECT col,visit FROM source_visits"):
-        source_visits.setdefault(col,set()).add(visit)
-    output_visits = {}
-    def ard_rows():
-        cursor = conn.execute("SELECT rid,k0,k1,k2,k3 FROM records ORDER BY rid")
-        for rid, *keys in cursor:
-            vals = {col:unpack(val) for col,val in conn.execute("SELECT col,val FROM cells WHERE rid=?", (rid,))}
-            visit = display(unpack(keys[1])) if keys[1] is not None else ""
-            if visit:
-                for col in vals: output_visits.setdefault(col,set()).add(visit)
-            yield [unpack(k) if k is not None else None for k in keys] + [vals.get(col) for col in ordered[4:]]
-    nrows = write_sheet(wb,"ARD",ordered,ard_rows())
-    for col in ordered[4:]:
-        src, out = source_visits.get(col,set()), output_visits.get(col,set())
-        unexpected = out - src
-        qc.append((col, SEP.join(sorted(src)), SEP.join(sorted(out)), SEP.join(sorted(unexpected)), "FAIL" if unexpected else "PASS"))
-    fails = [x for x in qc if x[-1] == "FAIL"]
-    if STRICT_VISIT_QC and fails:
-        raise RuntimeError(f"Visit QC failed for {len(fails)} columns; no output written. Examples: {fails[:5]}")
-    def dict_rows():
-        for (serialized,) in conn.execute("SELECT vals FROM dictionary"):
-            vals = json.loads(serialized)
-            yield [unpack(vals[c]) if c in vals else None for c in dict_columns]
-    write_sheet(wb,"PARAMCD_DICT",dict_columns or ["PARAMCD","PARAM","SOURCE"],dict_rows())
-    all_set = set(ordered)
-    def comparison_rows():
-        for name, rows, cols, incomplete, dups, groups in stats:
-            yield [name, rows, rows-dups, cols, incomplete, dups, groups, len(all_set)-cols]
-    write_sheet(wb,"FILE_COMPARISON",["FILE","ROWS","ROWS_AFTER_INTERNAL_CONSOLIDATION","COLUMNS","NULL_KEY_ROWS_KEPT_SEPARATE","DUPLICATE_COMPLETE_KEY_ROWS","DUPLICATE_COMPLETE_KEY_GROUPS","MISSING_FROM_GLOBAL_COLUMN_UNION"],comparison_rows())
-    write_sheet(wb,"VALUE_CONFLICTS",KEYS+["CONFLICT_STAGE","COLUMN","ACCUMULATED_FILES","ACCUMULATED_VALUE","INCOMING_FILE","INCOMING_VALUE","MERGED_VALUE"],
-        ([*r[1:5],r[0],*r[5:]] for r in conn.execute("SELECT * FROM conflicts")))
-    write_sheet(wb,"DUPLICATE_KEYS",["FILE",*KEYS,"ROW_COUNT","KEY_STATUS","ACTION","CONFLICT_COLUMNS"],
-        ([*r[:6],"COMPLETE","CONSOLIDATED",r[6]] for r in conn.execute("SELECT * FROM duplicate_groups")))
-    write_sheet(wb,"COLUMN_VISIT_QC",["COLUMN","SOURCE_POPULATED_VISITS","OUTPUT_POPULATED_VISITS","UNEXPECTED_OUTPUT_VISITS","QC_STATUS"],qc)
-    write_sheet(wb,"SOURCE_FILES",["LOAD_ORDER","FILE"],([i,name] for i,name in enumerate(FILES_TO_MERGE,1)))
-    path.parent.mkdir(parents=True,exist_ok=True)
-    tmp = path.with_name(path.stem + ".partial.xlsx")
+    sheet = wb.create_sheet("FILE_COMPARISON")
+    columns = ["FILE", "ROWS", "COLUMNS", "POPULATED_CELLS", "INCOMPLETE_KEY_ROWS"]
+    sheet.append(columns)
+    for rec in file_stats:
+        sheet.append([rec[c] for c in columns])
+    metrics = wb.create_sheet("RECONCILIATION_SUMMARY")
+    metrics.append(["METRIC", "VALUE"])
+    queries = [
+        ("Distinct clinical keys", "SELECT COUNT(*) FROM key_table"),
+        ("Variables in union", None),
+        ("Consolidated populated cells", "SELECT COUNT(*) FROM cells"),
+        ("Cells with conflicts", "SELECT COUNT(*) FROM cells WHERE n_values > 1"),
+        ("Distinct value alternatives", "SELECT COUNT(*) FROM distinct_values"),
+        ("Keys present in multiple input rows", "SELECT COUNT(*) FROM key_table WHERE input_rows > 1"),
+        ("Keys found in multiple source files", "SELECT COUNT(*) FROM key_table WHERE n_files > 1"),
+    ]
+    for label, query in queries:
+        val = total_columns if query is None else conn.execute(query).fetchone()[0]
+        metrics.append([label, val])
+    notes = wb.create_sheet("IMPORTANT_NOTES")
+    for text in [
+        "Values with >1 distinct alternative are represented as JSON arrays in the merged ARD.",
+        "Conflict cells are NOT numeric measurements; consult the lineage Parquet before analysis.",
+        "All original nonempty cell alternatives and their source files are in DATA_LINEAGE.parquet.",
+        "Only complete 4-component clinical keys are matched; incomplete keys stay separate.",
+        "This audit cannot establish whether source values were observed or imputed.",
+        "No automatic choice of latest source value is made when values disagree.",
+        "Excel exports are summary-only; full ARD is in Parquet to avoid worksheet row limits.",
+    ]:
+        notes.append([text])
+    wb.save(output_dir / "QUASAR_RECONCILIATION_SUMMARY.xlsx")
+
+
+def write_wide_parquet(conn, path: Path, all_columns: list[str]):
+    """Stream sorted sparse cells into wide Parquet without pivoting in RAM."""
+    schema = pa.schema([(col, pa.string()) for col in all_columns])
+    writer = pq.ParquetWriter(path, schema, compression="zstd")
+    sql = """
+        SELECT k.key_id, k.USUBJID, k.AVISIT, k.AVISITN, k.AVISIT_ORDER,
+               c.col_name, c.merged_value, c.n_values
+        FROM key_table k LEFT JOIN cells c ON k.key_id = c.key_id
+        ORDER BY k.key_id, c.col_name
+    """
+    cursor = conn.execute(sql)
+    output_batch: list[dict] = []
+    current_id = None
+    current_row = None
+    written = 0
     try:
-        wb.save(tmp)
-        tmp.replace(path)
+        while True:
+            fetched = cursor.fetchmany(20000)
+            if not fetched:
+                break
+            for rid, subject, visit, visitn, order, col, value, n_values in fetched:
+                if rid != current_id:
+                    if current_row is not None:
+                        output_batch.append(current_row)
+                    current_id = rid
+                    current_row = {"USUBJID": subject, "AVISIT": visit,
+                                   "AVISITN": visitn, "AVISIT_ORDER": order}
+                if col is not None:
+                    # JSON array is unambiguous even when original values contain '|'.
+                    current_row[col] = value
+                if len(output_batch) >= ROWS_PER_PARQUET_BATCH:
+                    table = pa.Table.from_pylist(output_batch, schema=schema)
+                    writer.write_table(table)
+                    written += len(output_batch)
+                    output_batch.clear()
+                    if written % 5000 < ROWS_PER_PARQUET_BATCH:
+                        print(f"  Wrote {written:,} merged ARD rows", flush=True)
+        if current_row is not None:
+            output_batch.append(current_row)
+        if output_batch:
+            writer.write_table(pa.Table.from_pylist(output_batch, schema=schema))
+            written += len(output_batch)
     finally:
-        wb.close()
-        gc.collect()
-        if tmp.exists():
-            try: tmp.unlink()
-            except PermissionError: print(f"WARNING: temporary output still locked: {tmp}")
-    print(f"Success: {path}\nRows: {nrows:,}; columns: {len(ordered):,}; visit QC failures: {len(fails)}")
+        writer.close()
+    print(f"Wide ARD written: {written:,} rows, {len(all_columns):,} columns", flush=True)
+
+
+def partition_observations(obs_csv: Path, folder: Path, n: int):
+    """Partition by key_id so every value for a clinical key stays together.
+
+    Only one output handle is open at a time to avoid OS file descriptor limits.
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    paths = [folder / f"obs_{i:03d}.csv" for i in range(n)]
+    # Buffer one modest chunk in RAM; distribute by first hash digits.
+    buffers = [[] for _ in range(n)]
+    buffered = 0
+    total = 0
+
+    def flush():
+        nonlocal buffered
+        for i, records in enumerate(buffers):
+            if not records:
+                continue
+            with paths[i].open("a", newline="", encoding="utf-8") as out:
+                csv.writer(out).writerows(records)
+            records.clear()
+        buffered = 0
+
+    with obs_csv.open(newline="", encoding="utf-8") as inp:
+        reader = csv.reader(inp)
+        header = next(reader)
+        for i, path in enumerate(paths):
+            with path.open("w", newline="", encoding="utf-8") as out:
+                csv.writer(out).writerow(header)
+        for rec in reader:
+            bucket = int(rec[0][:8], 16) % n
+            buffers[bucket].append(rec)
+            buffered += 1
+            total += 1
+            if buffered >= 10000:
+                flush()
+            if total % 5000000 == 0:
+                print(f"  Partitioned {total:,} observations", flush=True)
+    flush()
+    print(f"Partitioning finished: {total:,} observations in {n} buckets", flush=True)
+    return paths
+
+
+def aggregate_buckets(conn, paths: list[Path], stage: Path):
+    distinct_dir = stage / "distinct_parts"
+    cells_dir = stage / "cell_parts"
+    distinct_dir.mkdir()
+    cells_dir.mkdir()
+    for i, path in enumerate(paths):
+        distinct_path = distinct_dir / f"part_{i:03d}.parquet"
+        cells_path = cells_dir / f"part_{i:03d}.parquet"
+        # Each partition is a disjoint set of key_ids. No global GROUP BY needed.
+        conn.execute(f"""
+            CREATE TEMP TABLE bucket_distinct AS
+            SELECT key_id, col_name, val,
+                   MIN(TRY_CAST(file_order AS INTEGER)) AS first_order,
+                   STRING_AGG(DISTINCT source_file, ' | ' ORDER BY source_file) AS source_files,
+                   COUNT(*) AS source_occurrences
+            FROM read_csv({quoted(path)}, header=true, all_varchar=true)
+            GROUP BY key_id, col_name, val
+        """)
+        conn.execute("""
+            CREATE TEMP TABLE bucket_cells AS
+            SELECT key_id, col_name, COUNT(*) AS n_values,
+                   CASE WHEN COUNT(*)=1 THEN MIN(val)
+                        ELSE to_json(list(val ORDER BY first_order, val)) END AS merged_value
+            FROM bucket_distinct
+            GROUP BY key_id, col_name
+        """)
+        conn.execute(f"COPY bucket_distinct TO {quoted(distinct_path)} (FORMAT PARQUET, COMPRESSION ZSTD)")
+        conn.execute(f"COPY bucket_cells TO {quoted(cells_path)} (FORMAT PARQUET, COMPRESSION ZSTD)")
+        conn.execute("DROP TABLE bucket_cells")
+        conn.execute("DROP TABLE bucket_distinct")
+        path.unlink()
+        if (i + 1) % 8 == 0 or i + 1 == len(paths):
+            print(f"  Aggregated {i+1}/{len(paths)} buckets", flush=True)
+            check_disk(OUTPUT_FOLDER, required_gb=2)
+    conn.execute(f"CREATE VIEW distinct_values AS SELECT * FROM read_parquet({quoted(distinct_dir / '*.parquet')})")
+    conn.execute(f"CREATE VIEW cells AS SELECT * FROM read_parquet({quoted(cells_dir / '*.parquet')})")
 
 
 def main():
-    paths = [INPUT_FOLDER / name for name in FILES_TO_MERGE]
-    for path in paths:
-        if not path.is_file(): raise FileNotFoundError(path)
-    # Windows: avoid WAL sidecar files and ensure connections/cursors are released.
-    folder = Path(tempfile.mkdtemp(prefix="ard_merge_"))
-    conn = None
+    for filename in FILES_TO_MERGE:
+        if not (INPUT_FOLDER / filename).is_file():
+            raise FileNotFoundError(INPUT_FOLDER / filename)
+    OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
+    check_disk(OUTPUT_FOLDER)
+    stage = OUTPUT_FOLDER / "_working_v4_1"
+    if stage.exists():
+        raise RuntimeError(f"Staging directory already exists: {stage}. "
+                           "Review/remove it manually before a new run.")
+    stage.mkdir()
+    obs_csv = stage / "observations.csv"
+    rows_csv = stage / "row_keys.csv"
+    file_stats: list[dict] = []
+    all_columns = list(KEYS)
     try:
-        conn = sqlite3.connect(str(folder / "merge.sqlite"))
-        conn.execute("PRAGMA journal_mode=DELETE")
-        conn.execute("PRAGMA cache_size=-16000")
-        setup(conn)
-        columns, dict_columns, stats = [], [], []
-        for file in paths:
-            process(conn, file, columns, dict_columns, stats)
-        output(conn, OUTPUT_FOLDER / OUTPUT_NAME, columns, dict_columns, stats)
-        conn.commit()
-    finally:
-        if conn is not None:
+        with obs_csv.open("w", newline="", encoding="utf-8") as fo, \
+             rows_csv.open("w", newline="", encoding="utf-8") as fr:
+            ow, rw = csv.writer(fo), csv.writer(fr)
+            ow.writerow(["key_id", "col_name", "val", "source_file", "file_order", "row_number"])
+            rw.writerow(["key_id", *KEYS, "source_file", "row_number", "file_order", "complete_key"])
+            for order, filename in enumerate(FILES_TO_MERGE, start=1):
+                stream_workbook(INPUT_FOLDER / filename, order, ow, rw, all_columns, file_stats)
+                check_disk(OUTPUT_FOLDER, required_gb=2)
+        print("Aggregating with DuckDB...", flush=True)
+        db = stage / "reconciliation.duckdb"
+        conn = duckdb.connect(str(db))
+        try:
+            conn.execute(f"SET memory_limit='{MEMORY_LIMIT}'")
+            conn.execute(f"SET threads={THREADS}")
+            conn.execute(f"SET temp_directory={quoted(stage / 'duckdb_tmp')}")
+            conn.execute("SET preserve_insertion_order=false")
+            conn.execute(f"""
+                CREATE TABLE key_table AS
+                SELECT key_id,
+                       MIN(USUBJID) AS USUBJID, MIN(AVISIT) AS AVISIT,
+                       MIN(AVISITN) AS AVISITN, MIN(AVISIT_ORDER) AS AVISIT_ORDER,
+                       COUNT(*) AS input_rows, COUNT(DISTINCT source_file) AS n_files
+                FROM read_csv({quoted(rows_csv)}, header=true, all_varchar=true)
+                GROUP BY key_id
+            """)
+            # Bounded-memory reconciliation: no global GROUP BY on all observations.
+            print("Partitioning observations by clinical key...", flush=True)
+            obs_parts = partition_observations(obs_csv, stage / "obs_parts", OBS_PARTITIONS)
+            print("Aggregating partitions with DuckDB...", flush=True)
+            aggregate_buckets(conn, obs_parts, stage)
+            lineage = OUTPUT_FOLDER / "QUASAR_DATA_LINEAGE.parquet"
+            conn.execute(f"COPY (SELECT * FROM distinct_values) TO {quoted(lineage)} (FORMAT PARQUET, COMPRESSION ZSTD)")
+            conflict_parquet = OUTPUT_FOLDER / "QUASAR_VALUE_CONFLICTS.parquet"
+            conn.execute(f"""
+                COPY (
+                    SELECT k.USUBJID, k.AVISIT, k.AVISITN, k.AVISIT_ORDER,
+                           d.key_id, d.col_name AS COLUMN, d.val AS ALTERNATIVE_VALUE,
+                           d.source_files AS SOURCE_FILES, d.source_occurrences,
+                           c.n_values AS DISTINCT_VALUES
+                    FROM distinct_values d
+                    JOIN cells c ON d.key_id=c.key_id AND d.col_name=c.col_name
+                    JOIN key_table k ON k.key_id=d.key_id
+                    WHERE c.n_values > 1
+                ) TO {quoted(conflict_parquet)} (FORMAT PARQUET, COMPRESSION ZSTD)
+            """)
+            n_conflict_rows = conn.execute(f"""
+                SELECT COALESCE(SUM(n_values),0) FROM cells WHERE n_values>1
+            """).fetchone()[0]
+            if n_conflict_rows <= MAX_CONFLICT_CSV_ROWS:
+                csv_path = OUTPUT_FOLDER / "QUASAR_VALUE_CONFLICTS.csv"
+                conn.execute(f"""
+                    COPY (
+                        SELECT k.USUBJID, k.AVISIT, k.AVISITN, k.AVISIT_ORDER,
+                               d.col_name AS COLUMN, d.val AS ALTERNATIVE_VALUE,
+                               d.source_files AS SOURCE_FILES
+                        FROM distinct_values d
+                        JOIN cells c ON d.key_id=c.key_id AND d.col_name=c.col_name
+                        JOIN key_table k ON k.key_id=d.key_id
+                        WHERE c.n_values > 1
+                    ) TO {quoted(csv_path)} (HEADER, DELIMITER ',')
+                """)
+            else:
+                print(f"Conflict CSV omitted ({n_conflict_rows:,} alternatives); "
+                      "complete conflict report is in Parquet.", flush=True)
+            # Row-level duplicate report is compact; no arbitrary truncation.
+            conn.execute(f"""
+                COPY (
+                    SELECT * FROM key_table WHERE input_rows>1
+                ) TO {quoted(OUTPUT_FOLDER / 'QUASAR_DUPLICATE_KEYS.parquet')}
+                (FORMAT PARQUET, COMPRESSION ZSTD)
+            """)
+            export_summary(conn, OUTPUT_FOLDER, file_stats, len(all_columns))
+            write_wide_parquet(conn, OUTPUT_FOLDER / "QUASAR_ARD_MERGED.parquet", all_columns)
+        finally:
             conn.close()
-            del conn
-        gc.collect()
-        for attempt in range(5):
+        print("SUCCESS: review QUASAR_RECONCILIATION_SUMMARY.xlsx and conflicts before analysis.")
+    finally:
+        if not KEEP_STAGING_FILES:
             try:
-                shutil.rmtree(folder)
-                break
-            except PermissionError:
-                if attempt == 4:
-                    print(f"WARNING: temporary SQLite files remain locked: {folder}")
-                    print("The output workbook, if saved, is unaffected.")
-                else:
-                    time.sleep(1)
+                shutil.rmtree(stage)
+            except OSError as exc:
+                print(f"WARNING: Could not remove staging directory {stage}: {exc}")
 
-if __name__ == "__main__": main()
+
+if __name__ == "__main__":
+    main()
